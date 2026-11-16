@@ -1,4 +1,7 @@
 # token-radar-01 — Launch Radar (v3 candidate, model curve-4.0)
+[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/FadliAR/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/FadliAR/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
 Entry candidate for make.fun's token-radar-01 bounty: "Build the best token launch radar"
 ($1,325 in USDC, escrowed on Solana). **Status: prepared, NOT submitted** — the standing entry
