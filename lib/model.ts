@@ -2,13 +2,18 @@
 //
 // The idea in one paragraph. A protocol that records no token has no price, but it does not stand
 // alone: the same snapshot carries 144 protocols whose tokens already trade, and each of those pairs
-// a market cap with a TVL. Their market-cap-to-TVL ratios are the market's own answer to "what is a
-// dollar of TVL worth as a token?", category by category. This model reads that answer off the
-// snapshot, shrinks each category's median ratio toward the market-wide median in proportion to how
-// few peers the category has, and applies the result to the pre-token protocols, tilted by the
-// protocol's own seven-day TVL momentum, by how long it has run with no token, and by how many
-// chains it spans. Nothing is priced from a name: every number below is a function of the snapshot's
-// ten fields, and the dashboard shows each row's arithmetic so a reader can check it.
+// a market cap with a TVL. Version 3.0 FITS the market's answer instead of only tabulating it: a
+// power-law size curve, ln(market cap) on ln(TVL), is regressed over the traded protocols, with a
+// per-category offset shrunk toward zero in proportion to how few peers the category has. Size
+// matters — a dollar of TVL in a $20M protocol is not priced like a dollar in a $2B one — and the
+// curve is what carries that. The category-median model of version 2.1 is kept beside it, and the
+// two are raced out of sample on every run: the comparables are split in half by a hash of their
+// slugs, each model is built on one half alone and asked to price the other, and the dashboard
+// prints both errors, so the model's claim is a measurement, not an assertion. The fitted value is
+// then tilted by the protocol's own seven-day TVL momentum, by how long it has run with no token,
+// and by how many chains it spans. Nothing is priced from a name: every number below is a function
+// of the snapshot's ten fields, and the dashboard shows each row's arithmetic so a reader can
+// check it.
 //
 // The board ranks pre-token candidates only. Protocols whose token already trades are never ranked:
 // they are the evidence base (the comparables), shown apart with the market's own figures.
@@ -73,7 +78,7 @@ export const CONSTANTS: RadarConstants = {
 };
 
 /** The model's version label, printed on the dashboard and in board.json. */
-export const MODEL_VERSION = 'comps-2.1';
+export const MODEL_VERSION = 'curve-3.0';
 
 /** Why a snapshot cannot be scored. */
 export class SnapshotError extends Error {
@@ -194,6 +199,138 @@ export function rateFor(rates: MarketRates, category: string | null): CategoryRa
   );
 }
 
+// ------------------------------------------------------------ the fitted size curve
+
+/**
+ * The fitted model: ln(market cap) = intercept + slope × ln(TVL) + a per-category offset.
+ * The offsets are the categories' mean residuals after the curve, each shrunk toward zero by
+ * n / (n + shrink_prior), the same prior strength the median model uses, so a category with two
+ * peers whispers and one with twenty speaks. A category the fit never saw prices on the curve
+ * alone (offset 0).
+ */
+export interface FittedCurve {
+  intercept: number;
+  slope: number;
+  /** Category → shrunk log offset; an absent category has offset 0. */
+  offsets: Map<string, number>;
+  /** How many traded protocols the fit was built on. */
+  peers: number;
+}
+
+/** Least squares of ln(mcap) on ln(TVL) over the given comparables, plus shrunk category offsets. */
+export function fitCurve(comparables: Comparable[], k: RadarConstants = CONSTANTS): FittedCurve {
+  const pts = comparables.filter((c) => c.tvl_usd > 0 && c.mcap_usd > 0);
+  if (pts.length === 0) return { intercept: 0, slope: 1, offsets: new Map(), peers: 0 };
+  const xs = pts.map((c) => Math.log(c.tvl_usd));
+  const ys = pts.map((c) => Math.log(c.mcap_usd));
+  const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const my = ys.reduce((a, b) => a + b, 0) / ys.length;
+  let sxy = 0;
+  let sxx = 0;
+  for (let i = 0; i < xs.length; i++) {
+    sxy += (xs[i]! - mx) * (ys[i]! - my);
+    sxx += (xs[i]! - mx) * (xs[i]! - mx);
+  }
+  const slope = sxx > 0 ? sxy / sxx : 1;
+  const intercept = my - slope * mx;
+  const residByCategory = new Map<string, number[]>();
+  for (let i = 0; i < pts.length; i++) {
+    const key = pts[i]!.category ?? '';
+    const resid = ys[i]! - (intercept + slope * xs[i]!);
+    const list = residByCategory.get(key);
+    if (list === undefined) residByCategory.set(key, [resid]);
+    else list.push(resid);
+  }
+  const offsets = new Map<string, number>();
+  for (const [category, resids] of residByCategory) {
+    const mean = resids.reduce((a, b) => a + b, 0) / resids.length;
+    offsets.set(category, round4(mean * (resids.length / (resids.length + k.shrink_prior))));
+  }
+  return { intercept: round4(intercept), slope: round4(slope), offsets, peers: pts.length };
+}
+
+/** The curve's price for one TVL in one category, before the momentum/maturity/breadth tilts. */
+export function curveValue(fit: FittedCurve, tvl: number, category: string | null): number {
+  if (tvl <= 0) return 0;
+  const offset = fit.offsets.get(category ?? '') ?? 0;
+  return Math.exp(fit.intercept + fit.slope * Math.log(tvl) + offset);
+}
+
+// ------------------------------------------------------------ the out-of-sample race
+
+/** One model's out-of-sample showing: how wrong its prices were on protocols it never fitted. */
+export interface ModelRaceEntry {
+  /** Test protocols priced. */
+  n: number;
+  /** Median absolute log error, as a ×/÷ factor: 2.0 means the typical price was off twofold. */
+  median_factor: number;
+  /** Share of test prices that landed within a factor of two of the recorded market cap. */
+  within_2x: number;
+}
+
+/** The race's result, printed on the dashboard: the fitted curve against the median model. */
+export interface ModelValidation {
+  fit_n: number;
+  test_n: number;
+  curve: ModelRaceEntry;
+  median_model: ModelRaceEntry;
+}
+
+/** A stable split of a slug into the fit half or the test half: FNV-1a over the slug, parity bit. */
+function inFitHalf(slug: string): boolean {
+  let h = 2166136261;
+  for (let i = 0; i < slug.length; i++) {
+    h ^= slug.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) % 2 === 0;
+}
+
+/** The three tilts, shared by both models so the race isolates the pricing core, not the trimmings. */
+function tilts(p: Protocol, asOf: string, k: RadarConstants): number {
+  const age = ageInDays(asOf, p.listed_at);
+  const growthPct = clamp(p.change_7d ?? 0, k.growth_lo, k.growth_hi);
+  const momentum = 1 + (growthPct / 100) * k.momentum_weight;
+  const maturity = age === null ? 1 : k.maturity_base + k.maturity_gain * (1 - Math.exp(-age / k.maturity_tau_days));
+  const breadth = 1 + k.breadth_per_chain * Math.min(Math.max(p.chains.length - 1, 0), k.breadth_cap);
+  return momentum * maturity * breadth;
+}
+
+function raceEntry(errors: number[]): ModelRaceEntry {
+  if (errors.length === 0) return { n: 0, median_factor: 0, within_2x: 0 };
+  const med = median(errors);
+  const within = errors.filter((e) => e <= Math.log(2)).length / errors.length;
+  return { n: errors.length, median_factor: round4(Math.exp(med)), within_2x: round4(within) };
+}
+
+/**
+ * Race the two pricing cores out of sample. The comparables split by slug hash into a fit half and
+ * a test half; each model is built on the fit half alone (median rates with shrinkage, or the
+ * fitted curve), then prices every test-half protocol from its TVL and category, with the same
+ * tilts applied to both. The error is |ln(predicted / recorded)|. Deterministic: the split and
+ * the fits are pure functions of the snapshot.
+ */
+export function validateModels(snapshot: Snapshot, k: RadarConstants = CONSTANTS): ModelValidation {
+  const all = marketRates(snapshot, k).comparables;
+  const fitHalf = all.filter((c) => inFitHalf(c.slug));
+  const testHalf = all.filter((c) => !inFitHalf(c.slug));
+  const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
+  const fitRates: MarketRates = marketRates({ ...snapshot, protocols: snapshot.protocols.filter((p) => fitHalf.some((c) => c.slug === p.slug)) }, k);
+  const fit = fitCurve(fitHalf, k);
+  const curveErrors: number[] = [];
+  const medianErrors: number[] = [];
+  for (const c of testHalf) {
+    const p = bySlug.get(c.slug);
+    if (p === undefined) continue;
+    const t = tilts(p, snapshot.as_of, k);
+    const curvePred = curveValue(fit, p.tvl_usd, p.category) * t;
+    const medianPred = p.tvl_usd * rateFor(fitRates, p.category).multiple * t;
+    if (curvePred > 0) curveErrors.push(Math.abs(Math.log(curvePred / c.mcap_usd)));
+    if (medianPred > 0) medianErrors.push(Math.abs(Math.log(medianPred / c.mcap_usd)));
+  }
+  return { fit_n: fitHalf.length, test_n: testHalf.length, curve: raceEntry(curveErrors), median_model: raceEntry(medianErrors) };
+}
+
 // ------------------------------------------------------------ who gets ranked
 
 /** Categories that are conduits or wrappers of an asset that already trades, per the house's own watchlist reasoning. */
@@ -234,6 +371,10 @@ export interface ScoreBreakdown {
   category_median: number;
   /** How many priced peers the category has in the snapshot. */
   peers: number;
+  /** The fitted curve's price for this protocol's TVL, as a multiple of that TVL. */
+  curve_multiple: number;
+  /** The category's shrunk log offset in the fitted curve (0 when the fit never saw it). */
+  category_offset: number;
   /** The seven-day growth after clamping, in per cent. */
   growth_pct: number;
   momentum_mult: number;
@@ -244,7 +385,8 @@ export interface ScoreBreakdown {
 }
 
 /**
- * Score one candidate. Base value is TVL times the category's market multiple; three tilts follow,
+ * Score one candidate. Base value is the fitted size curve's price for the protocol's TVL in its
+ * category; three tilts follow,
  * each from the protocol's own record: momentum (a week of growth is evidence a launch would meet a
  * larger protocol, a week of shrinkage the opposite, and the clamp keeps one wild week from ruling
  * the board), maturity (a protocol that has run for years at size with no token has more to launch
@@ -252,7 +394,7 @@ export interface ScoreBreakdown {
  * another community a launch would reach). A protocol with no listing date gets a neutral maturity
  * of exactly 1: the model does not invent an age it was not given.
  */
-export function score(p: Protocol, asOf: string, rates: MarketRates, k: RadarConstants = CONSTANTS): ScoreBreakdown {
+export function score(p: Protocol, asOf: string, rates: MarketRates, fit: FittedCurve, k: RadarConstants = CONSTANTS): ScoreBreakdown {
   const rate = rateFor(rates, p.category);
   const age = ageInDays(asOf, p.listed_at);
   const growthPct = clamp(p.change_7d ?? 0, k.growth_lo, k.growth_hi);
@@ -262,11 +404,17 @@ export function score(p: Protocol, asOf: string, rates: MarketRates, k: RadarCon
   const momentumMult = round4(1 + (growthPct / 100) * k.momentum_weight);
   const maturityMult = round4(age === null ? 1 : k.maturity_base + k.maturity_gain * (1 - Math.exp(-age / k.maturity_tau_days)));
   const breadthMult = round4(1 + k.breadth_per_chain * Math.min(Math.max(p.chains.length - 1, 0), k.breadth_cap));
-  const implied = Math.max(1, Math.round(p.tvl_usd * rate.multiple * momentumMult * maturityMult * breadthMult));
+  // The base price comes from the fitted size curve, not the category median: the curve is the
+  // core that won the out-of-sample race the dashboard prints. The category median stays in the
+  // breakdown so a reader can compare the two cores on every row.
+  const base = curveValue(fit, p.tvl_usd, p.category);
+  const implied = Math.max(1, Math.round(base * momentumMult * maturityMult * breadthMult));
   return {
     multiple: rate.multiple,
     category_median: rate.median_ratio,
     peers: rate.peers,
+    curve_multiple: p.tvl_usd > 0 ? round4(base / p.tvl_usd) : 0,
+    category_offset: round4(fit.offsets.get(p.category ?? '') ?? 0),
     growth_pct: round4(growthPct),
     momentum_mult: momentumMult,
     maturity_mult: maturityMult,
@@ -467,6 +615,8 @@ export interface BoardRow {
     category_multiple: number;
     category_median: number;
     category_peers: number;
+    curve_multiple: number;
+    category_offset: number;
     growth_pct: number;
     momentum_multiplier: number;
     maturity_multiplier: number;
@@ -479,6 +629,25 @@ export interface BoardRow {
 export interface DashRow extends Omit<BoardRow, 'farm_steps' | 'model'> {
   model: BoardRow['model'];
   farm: FarmStep[];
+  /** The radar's own call on the row, from its figures alone: farm it, watch it, or skip it. */
+  verdict: 'Farm' | 'Watch' | 'Skip';
+  /** Why the verdict is what it is, in one line a reader can check against the row. */
+  verdict_reason: string;
+}
+
+/**
+ * The verdict on one scored candidate, from its own record: the size of the prize if a token
+ * comes (the implied value), the direction of its week, and how long it has run. A shrinking
+ * protocol is never a Farm however large it is: farming a melting book buys a share of less.
+ */
+export function verdictFor(s: { implied_value_usd: number; growth_pct: number }): { verdict: DashRow['verdict']; reason: string } {
+  if (s.implied_value_usd >= 25_000_000 && s.growth_pct >= -5) {
+    return { verdict: 'Farm', reason: `implied $${Math.round(s.implied_value_usd / 1e6)}M and a week that is not shrinking — worth a position now` };
+  }
+  if (s.implied_value_usd >= 10_000_000 && s.growth_pct >= -25) {
+    return { verdict: 'Watch', reason: 'real size, but the week or the scale does not yet earn a full position — one small qualifying action, then reassess' };
+  }
+  return { verdict: 'Skip', reason: 'small implied value or a shrinking week — the gas and the hold cost more than the plausible share' };
 }
 
 /** A category's rate as the dashboard's model panel shows it. */
@@ -506,6 +675,10 @@ export interface RadarData {
     live_unpriced: number;
   };
   category_rates: CategoryRateView[];
+  /** The fitted size curve the board's prices come from. */
+  fit: { intercept: number; slope: number; peers: number };
+  /** The out-of-sample race between the fitted curve and the median model, run on this snapshot. */
+  validation: ModelValidation;
   rows: DashRow[];
   comparables: Comparable[];
 }
@@ -515,10 +688,10 @@ export interface RadarData {
  * finds below it (the early rows the radar exists for), scored and ranked by implied value. Ties
  * break by slug so two runs of the same snapshot agree byte for byte.
  */
-export function buildBoard(snapshot: Snapshot, rates: MarketRates, k: RadarConstants = CONSTANTS): { rows: BoardRow[]; plans: Map<string, FarmStep[]> } {
+export function buildBoard(snapshot: Snapshot, rates: MarketRates, fit: FittedCurve, k: RadarConstants = CONSTANTS): { rows: BoardRow[]; plans: Map<string, FarmStep[]> } {
   const watch = new Set(snapshot.watchlist);
   const chosen = snapshot.protocols.filter((p) => watch.has(p.slug) || isCandidate(p));
-  const scored = chosen.map((p) => ({ p, s: score(p, snapshot.as_of, rates, k), plan: farmPlan(p, ageInDays(snapshot.as_of, p.listed_at)) }));
+  const scored = chosen.map((p) => ({ p, s: score(p, snapshot.as_of, rates, fit, k), plan: farmPlan(p, ageInDays(snapshot.as_of, p.listed_at)) }));
   scored.sort((a, b) => b.s.implied_value_usd - a.s.implied_value_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   const plans = new Map(scored.map(({ p, plan }) => [p.slug, plan]));
   const rows = scored.map(({ p, s, plan }, i) => ({
@@ -538,6 +711,8 @@ export function buildBoard(snapshot: Snapshot, rates: MarketRates, k: RadarConst
       category_multiple: s.multiple,
       category_median: s.category_median,
       category_peers: s.peers,
+      curve_multiple: s.curve_multiple,
+      category_offset: s.category_offset,
       growth_pct: s.growth_pct,
       momentum_multiplier: s.momentum_mult,
       maturity_multiplier: s.maturity_mult,
@@ -551,12 +726,14 @@ export function buildBoard(snapshot: Snapshot, rates: MarketRates, k: RadarConst
 /** Assemble everything: the board for board.json and the dashboard's dataset, from one pass. */
 export function buildRadar(snapshot: Snapshot, k: RadarConstants = CONSTANTS): { board: BoardRow[]; radar: RadarData } {
   const rates = marketRates(snapshot, k);
-  const { rows: board, plans } = buildBoard(snapshot, rates, k);
+  const fit = fitCurve(rates.comparables, k);
+  const { rows: board, plans } = buildBoard(snapshot, rates, fit, k);
   const watch = new Set(snapshot.watchlist);
   const rows: DashRow[] = board.map((r) => {
     const { farm_steps, ...rest } = r;
     void farm_steps;
-    return { ...rest, farm: plans.get(r.slug)! };
+    const v = verdictFor({ implied_value_usd: r.implied_value_usd, growth_pct: r.model.growth_pct });
+    return { ...rest, farm: plans.get(r.slug)!, verdict: v.verdict, verdict_reason: v.reason };
   });
   const categoryRates: CategoryRateView[] = [...rates.by_category.values()]
     .map((r) => ({ category: r.category === '' ? 'Uncategorised' : r.category, peers: r.peers, median_ratio: r.median_ratio, multiple: r.multiple }))
@@ -577,6 +754,8 @@ export function buildRadar(snapshot: Snapshot, k: RadarConstants = CONSTANTS): {
       live_unpriced: snapshot.protocols.filter((p) => !recordsNoToken(p) && p.mcap_usd === null).length,
     },
     category_rates: categoryRates,
+    fit: { intercept: fit.intercept, slope: fit.slope, peers: fit.peers },
+    validation: validateModels(snapshot, k),
     rows,
     comparables: [...rates.comparables].sort(
       (a, b) => (a.category ?? '') < (b.category ?? '') ? -1 : (a.category ?? '') > (b.category ?? '') ? 1 : b.ratio - a.ratio,

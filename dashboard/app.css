@@ -116,6 +116,9 @@ td .psub { display: block; font-size: 12px; color: var(--faint); }
 }
 .badge.watch { background: var(--amber); color: #221a05; }
 .badge.early { background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); }
+.badge.vfarm { background: #1d5c38; color: #c9f2da; }
+.badge.vwatch { background: #274b63; color: #cfe8f7; }
+.badge.vskip { background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); }
 .implied { display: flex; align-items: center; gap: 9px; justify-content: flex-end; }
 .bar { width: 92px; height: 6px; background: var(--line-soft); border-radius: 3px; overflow: hidden; flex: none; }
 .bar i { display: block; height: 100%; background: var(--accent); }

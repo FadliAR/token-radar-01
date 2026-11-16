@@ -39,7 +39,7 @@
   // land on the figure board.json carries for that row. Same order of operations as lib/model.ts.
   function impliedOf(r) {
     var m = r.model;
-    return Math.max(1, Math.round(r.tvl_usd * m.category_multiple * m.momentum_multiplier * m.maturity_multiplier * m.breadth_multiplier));
+    return Math.max(1, Math.round(r.tvl_usd * m.curve_multiple * m.momentum_multiplier * m.maturity_multiplier * m.breadth_multiplier));
   }
   function chainsLabel(r) { return r.chains && r.chains.length ? r.chains.slice(0, 3).join(', ') + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') : 'no chain on record'; }
 
@@ -93,14 +93,19 @@
     var topRates = D.category_rates.slice(0, 10).map(function (r) {
       return '<span class="rate-chip">' + esc(r.category) + ' <b>' + fmtMult(r.multiple) + '</b> · ' + r.peers + ' peers</span>';
     }).join('');
+    var f = D.fit, v = D.validation;
     $('modelband').innerHTML =
       '<h2>How an implied value is derived</h2>' +
-      '<p>Each candidate is priced off its own kind. The snapshot\'s <b>' + c.comparables + ' priced peers</b> — protocols whose token already trades — ' +
-      'give a market-cap-to-TVL ratio per category; a category\'s multiple is its <b>median ratio, shrunk toward the market-wide median ' + fmtMult(D.global_median) +
-      '</b> with a prior of ' + k.shrink_prior + ' phantom peers, so a category with one peer stays near the market and one with fifteen speaks for itself. ' +
-      'Peer ratios are winsorized to ' + k.ratio_lo + '–' + k.ratio_hi + '× so one outlier cannot carry a category. Three tilts follow from the protocol\'s own record: ' +
-      'its 7-day TVL momentum, how long it has run with no token, and how many chains it spans. No name is priced by hand.</p>' +
-      '<div class="formula">implied = TVL × category multiple × (1 + clamp(7d growth, ' + k.growth_lo + '%, +' + k.growth_hi + '%) × ' + k.momentum_weight + ') × maturity(age) × (1 + ' + k.breadth_per_chain + ' × extra chains)</div>' +
+      '<p>Each candidate is priced by a <b>size curve fitted to ' + f.peers + ' of the snapshot\'s priced peers</b> — those with a positive recorded cap, since a log fit cannot use a cap of zero: ' +
+      'ln(market cap) = ' + f.intercept.toFixed(2) + ' + ' + f.slope.toFixed(2) + ' × ln(TVL), plus a per-category offset shrunk toward zero with a prior of ' + k.shrink_prior +
+      ' phantom peers, so a category with two peers whispers and one with twenty speaks. A slope under 1 is the market\'s own size discount: a dollar of TVL in a small protocol ' +
+      'is priced richer than a dollar in a giant, and a flat category multiple cannot see that. The older median model is kept as the challenger, and the two are ' +
+      '<b>raced out of sample on every run</b>: the peers split by a hash of their names, each model is built on one half alone and prices the other half\'s ' + v.test_n + ' protocols. ' +
+      'On this snapshot the fitted curve\'s typical price was off by a factor of <b>' + v.curve.median_factor.toFixed(2) + '×</b> with ' + Math.round(v.curve.within_2x * 100) +
+      '% inside twofold, against <b>' + v.median_model.median_factor.toFixed(2) + '×</b> and ' + Math.round(v.median_model.within_2x * 100) +
+      '% for the median model — so the curve carries the board, and the medians stay printed on every row for comparison. ' +
+      'Three tilts follow from the protocol\'s own record: its 7-day TVL momentum, how long it has run with no token, and how many chains it spans. No name is priced by hand.</p>' +
+      '<div class="formula">implied = exp(' + f.intercept.toFixed(2) + ' + ' + f.slope.toFixed(2) + ' × ln(TVL) + category offset) × (1 + clamp(7d growth, ' + k.growth_lo + '%, +' + k.growth_hi + '%) × ' + k.momentum_weight + ') × maturity(age) × (1 + ' + k.breadth_per_chain + ' × extra chains)</div>' +
       '<div class="rates">' + topRates + '</div>';
 
     $('colophon').innerHTML =
@@ -179,7 +184,7 @@
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? -1 : a.age_days; bv = b.age_days === null ? -1 : b.age_days; }
-      else if (key === 'mult') { av = a.model.category_multiple; bv = b.model.category_multiple; }
+      else if (key === 'mult') { av = a.model.curve_multiple; bv = b.model.curve_multiple; }
       else if (key === 'implied') { av = a.implied_value_usd; bv = b.implied_value_usd; }
       else { av = a.rank; bv = b.rank; }
       if (av < bv) return -dir;
@@ -204,13 +209,14 @@
     var body = list.map(function (r) {
       var g = r.change_7d;
       var badge = r.on_watchlist ? '<span class="badge watch">Watchlist</span>' : '<span class="badge early">Early</span>';
+      var vbadge = '<span class="badge v' + r.verdict.toLowerCase() + '">' + r.verdict + '</span>';
       return '<tr data-slug="' + esc(r.slug) + '" tabindex="0" aria-selected="' + (state.selected === r.slug) + '">' +
         '<td class="rank">' + r.rank + '</td>' +
-        '<td><span class="pname">' + esc(r.name) + '</span>' + badge + '<span class="psub">' + esc(r.category || 'Uncategorised') + ' · ' + esc(chainsLabel(r)) + '</span></td>' +
+        '<td><span class="pname">' + esc(r.name) + '</span>' + badge + vbadge + '<span class="psub">' + esc(r.category || 'Uncategorised') + ' · ' + esc(chainsLabel(r)) + '</span></td>' +
         '<td class="r num">' + fmtUsd(r.tvl_usd) + '</td>' +
         '<td class="r num ' + (g === null ? '' : g >= 0 ? 'pos' : 'neg') + '">' + fmtPct(g) + '</td>' +
         '<td class="r num">' + fmtAge(r.age_days) + '</td>' +
-        '<td class="r num">' + fmtMult(r.model.category_multiple) + '</td>' +
+        '<td class="r num">' + fmtMult(r.model.curve_multiple) + '</td>' +
         '<td class="r"><div class="implied"><span class="bar"><i style="width:' + Math.max(2, Math.round((r.implied_value_usd / max) * 100)) + '%"></i></span><span class="num">' + fmtUsd(r.implied_value_usd) + '</span></div></td>' +
         '</tr>';
     }).join('');
@@ -274,7 +280,7 @@
       '<h3>How this value is derived</h3>' +
       '<table class="derive"><tbody>' +
       '<tr><td>Total value locked</td><td class="r">' + usdFull.format(r.tvl_usd) + '</td></tr>' +
-      '<tr><td>× Category multiple (' + esc(r.category || 'Uncategorised') + ': median ' + fmtMult(m.category_median) + ' over ' + m.category_peers + ' priced peer' + (m.category_peers === 1 ? '' : 's') + ', shrunk toward ' + fmtMult(D.global_median) + ')</td><td class="r">' + fmtMult(m.category_multiple) + '</td></tr>' +
+      '<tr><td>× Fitted size curve (ln cap = ' + D.fit.intercept.toFixed(2) + ' + ' + D.fit.slope.toFixed(2) + ' × ln TVL, ' + esc(r.category || 'Uncategorised') + ' offset ' + (m.category_offset >= 0 ? '+' : '') + m.category_offset.toFixed(2) + '; the category median model would say ' + fmtMult(m.category_multiple) + ' — median ' + fmtMult(m.category_median) + ' over ' + m.category_peers + ' priced peer' + (m.category_peers === 1 ? '' : 's') + ')</td><td class="r">' + fmtMult(m.curve_multiple) + '</td></tr>' +
       '<tr><td>× Momentum (7d growth ' + fmtPct(m.growth_pct) + ', clamped)</td><td class="r">' + fmtMult(m.momentum_multiplier) + '</td></tr>' +
       '<tr><td>× Maturity (' + (r.age_days === null ? 'no listing date — neutral' : fmtAge(r.age_days) + ' with no token') + ')</td><td class="r">' + fmtMult(m.maturity_multiplier) + '</td></tr>' +
       '<tr><td>× Breadth (' + (r.chains || []).length + ' chains)</td><td class="r">' + fmtMult(m.breadth_multiplier) + '</td></tr>' +
@@ -282,6 +288,7 @@
       '</tbody></table>' +
       '<p class="checkline">This page multiplies the same five figures and gets <b>' + usdFull.format(recomputed) + '</b>' +
       (recomputed === r.implied_value_usd ? ' — the board\'s figure, recomputed in your browser.' : ' — within a rounding dollar of the board\'s figure.') + '</p>' +
+      '<h3>Verdict: ' + esc(r.verdict) + '</h3><p class="sub">' + esc(r.verdict_reason) + '.</p>' +
       '<h3>Farm plan</h3><ol class="plan">' + steps + '</ol>' +
       '<p class="sub">Costs are indicative, in the chain\'s own terms at snapshot time; the plan is generated from this protocol\'s category, chains, TVL and age — the same derivation board.json carries.</p>';
     $('drawer').hidden = false;
