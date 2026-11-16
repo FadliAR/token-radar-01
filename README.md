@@ -1,68 +1,46 @@
-# token-radar-01 — Launch Radar
+# token-radar-01 — Launch Radar (v3 candidate, model curve-4.0)
 
-[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
-[![rank](https://make.fun/badge/token-radar-01/FadliAR/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
-[![reward](https://make.fun/badge/token-radar-01/FadliAR/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+Entry candidate for make.fun's token-radar-01 bounty: "Build the best token launch radar"
+($1,325 in USDC, escrowed on Solana). **Status: prepared, NOT submitted** — the standing entry
+is v2 (curve-3.0) in `../token-radar-01-v2/`; this directory is the v3 candidate. See
+`GAP-ANALYSIS.md` for why it exists and `BACKTEST.md` for the v2-vs-v3 evidence.
 
-Entry for make.fun's [token-radar-01 bounty](https://make.fun/bounty/token-radar-01):
-"Build the best token launch radar" ($1,325 in USDC, escrowed on Solana).
+**Launch Radar** ranks the 198 pre-token protocols in the competition's frozen DefiLlama
+snapshot (758 protocols, as of 2026-11-14) by implied launch value, and nets a farm verdict in
+dollars for every row. Everything is derived from the snapshot's own figures; nothing is
+fetched live and no name is priced by hand.
 
-**Launch Radar** ranks protocols that record no token yet by what a launch
-could be worth, and shows a reader how to farm each one. It reads the
-competition's frozen DefiLlama snapshot (758 protocols, fetched 2026-11-14)
-and derives everything from that file's own figures — no name is priced by
-hand, and nothing is fetched live.
+## The model (lib/model.ts, curve-4.0)
 
-## The model (lib/model.ts, version comps-2.1)
+- A power-law size curve, ln(market cap) on ln(TVL), fitted by least squares over **118
+  cleaned traded peers** (of 128 positively priced: CEX and Chain tokens are kept out of the
+  fit — their prices are not read off a protocol's TVL), with per-category log offsets shrunk
+  toward zero by n/(n+6).
+- Three tilts from each protocol's own record: 7-day momentum, tokenless maturity, chain
+  breadth.
+- **Uncertainty**: 200 seeded bootstrap refits give every row a P25–P75 value band and a
+  P10–P90 rank range.
+- **Farm economics**: slice = 10% of implied value × ticket ÷ TVL (ticket $250–$5,000 scaled
+  to the pool), minus fees summed from a seven-step day-stamped plan, minus 4%-a-year forgone
+  interest. Verdicts: **Farm** (pays even at the band's low end), **Thin** (pays at the point
+  estimate only), **Skip** (does not cover costs) — 98 / 20 / 80 on this snapshot.
+- **Validation, printed in full on the dashboard's Method view**: leave-one-out ladder
+  (×3.53 median miss for the full model vs ×4.83 for a flat multiple), a time split
+  (fit pre-2024 → price 2024+: ×2.48), the slug-hash split in both directions against the
+  v3.0 recipe, and an age split.
+- The dashboard **recomputes the whole model in the browser** (fit, bootstrap, economics)
+  and reports the match against board.json: 198/198 on all four figure classes.
 
-A pre-token protocol has no price, but the same snapshot carries 144
-protocols whose tokens already trade, each pairing a market cap with a TVL.
-Their market-cap-to-TVL ratios are the market's own answer to "what is a
-dollar of TVL worth as a token?", category by category:
-
-- Each peer ratio is winsorized to 0.01–4×, so one outlier cannot carry a
-  category.
-- A category's multiple is its **median ratio shrunk toward the market-wide
-  median (0.17×)** with a prior of six phantom peers: a category with one
-  priced peer stays near the market rate, a category with fifteen speaks for
-  itself. A category with no priced peer uses the market-wide median.
-- A candidate's implied value is its TVL × its category multiple, tilted by
-  three factors from its own record: 7-day TVL momentum (growth clamped to
-  −60%…+120%, weight 0.4), maturity (0.75 rising toward 1.20 with tokenless
-  age on a saturating curve; a protocol with no listing date is neutral), and
-  breadth (+2% per extra chain, capped at ten).
-- Every factor is rounded to four decimals before it is applied, so the
-  breakdown printed in a protocol's detail view multiplies out to exactly
-  the figure board.json carries.
-
-The board covers all 40 watchlist protocols (TVL ≥ $50M, no token on
-record) and adds every other genuine launch candidate the same filter finds
-below that floor — 198 rows in all. Exchanges, bridges, liquid-staking and
-other wrappers of assets that already trade, and versioned redeployments,
-are not launch candidates and are never ranked. Protocols whose token
-already trades are shown apart, in the dashboard's Comparables view, as the
-evidence base the multiples come from.
-
-Each row carries a six-step farm plan generated from the protocol's own
-category, chains, TVL and age: the moves a real user would make, with an
-indicative cost and a time for every step.
-
-## The dashboard (dashboard/)
-
-A static, offline page — no framework, no network: a sortable, filterable
-board (search, category, chain, TVL band, watchlist-only), a detail drawer
-per protocol with its full derivation and farm plan, and the comparables
-view. The three screenshots are real renders of it.
-
-## Running it
-
-Node 22.18+, standard library only:
+## Run
 
 ```
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <kit>/input/snapshot.json
+node tools/backtest.mjs   # v2 vs v3 under identical protocols (needs ../token-radar-01-v2/)
 ```
 
-A run writes `board.json`, `data.js`, `dashboard/`, `screenshots/` and
-`dossier.json` (built with the vendored `vendor/makefun-board.ts`) into the
-output directory, deterministically: two runs of the same snapshot produce
-identical bytes.
+A run is a pure function of the snapshot: two runs produce byte-identical board.json,
+data.js and dossier.json.
+
+Proposed submission title: "Launch Radar — comps-fitted size curve (time-split ×2.48,
+leave-one-out ×3.53), 198 pre-token protocols with bootstrap bands and farm verdicts
+netted at the band's low end".

@@ -78,7 +78,7 @@ export const CONSTANTS: RadarConstants = {
 };
 
 /** The model's version label, printed on the dashboard and in board.json. */
-export const MODEL_VERSION = 'curve-3.0';
+export const MODEL_VERSION = 'curve-4.0';
 
 /** Why a snapshot cannot be scored. */
 export class SnapshotError extends Error {
@@ -124,6 +124,9 @@ export interface Comparable {
   mcap_usd: number;
   /** mcap / TVL after winsorizing into the model's band. */
   ratio: number;
+  change_7d: number | null;
+  listed_at: string | null;
+  n_chains: number;
 }
 
 /** What the market pays for a dollar of TVL in one category, as this snapshot records it. */
@@ -168,6 +171,9 @@ export function marketRates(snapshot: Snapshot, k: RadarConstants = CONSTANTS): 
       tvl_usd: p.tvl_usd,
       mcap_usd: p.mcap_usd,
       ratio: round4(clamp(p.mcap_usd / p.tvl_usd, k.ratio_lo, k.ratio_hi)),
+      change_7d: p.change_7d,
+      listed_at: p.listed_at,
+      n_chains: p.chains.length,
     });
   }
   const globalMedian = comparables.length > 0 ? median(comparables.map((c) => c.ratio)) : 0;
@@ -256,6 +262,19 @@ export function curveValue(fit: FittedCurve, tvl: number, category: string | nul
   return Math.exp(fit.intercept + fit.slope * Math.log(tvl) + offset);
 }
 
+/**
+ * Categories whose tokens are not priced off the protocol's own TVL, kept out of the FIT (they stay
+ * in the traded view and in the median model): an exchange's token prices the exchange's order flow,
+ * not the TVL its record happens to track, and a chain's token prices the whole network. Fitting the
+ * size curve through them bends it toward prices no launch candidate could inherit.
+ */
+export const FIT_EXCLUDED_CATEGORIES = new Set(['CEX', 'Chain']);
+
+/** The comparables the size curve is actually fitted on: positively priced, minus the exclusions above. */
+export function fitComparables(comparables: Comparable[]): Comparable[] {
+  return comparables.filter((c) => c.mcap_usd > 0 && c.tvl_usd > 0 && !FIT_EXCLUDED_CATEGORIES.has(c.category ?? ''));
+}
+
 // ------------------------------------------------------------ the out-of-sample race
 
 /** One model's out-of-sample showing: how wrong its prices were on protocols it never fitted. */
@@ -329,6 +348,207 @@ export function validateModels(snapshot: Snapshot, k: RadarConstants = CONSTANTS
     if (medianPred > 0) medianErrors.push(Math.abs(Math.log(medianPred / c.mcap_usd)));
   }
   return { fit_n: fitHalf.length, test_n: testHalf.length, curve: raceEntry(curveErrors), median_model: raceEntry(medianErrors) };
+}
+
+// ------------------------------------------------------------ the v4 validation suite
+
+/** One model's out-of-sample showing in the wider suite: both of the race's metrics, plus within-3x. */
+export interface ValidationRow {
+  model: string;
+  n: number;
+  median_factor: number;
+  within_2x: number;
+  within_3x: number;
+}
+
+/** Everything the dashboard's method view prints: leave-one-out, a time split, both hash splits, an age split. */
+export interface ValidationSuite {
+  loo: ValidationRow[];
+  time_split: { fit_n: number; test_n: number; rows: ValidationRow[] };
+  hash_a: ValidationRow[];
+  hash_b: ValidationRow[];
+  age_split: { young: ValidationRow; old: ValidationRow };
+}
+
+function metricsOf(errors: number[], model: string): ValidationRow {
+  if (errors.length === 0) return { model, n: 0, median_factor: 0, within_2x: 0, within_3x: 0 };
+  return {
+    model,
+    n: errors.length,
+    median_factor: round4(Math.exp(median(errors))),
+    within_2x: round4(errors.filter((e) => e <= Math.log(2)).length / errors.length),
+    within_3x: round4(errors.filter((e) => e <= Math.log(3)).length / errors.length),
+  };
+}
+
+/** A pricing core under test: build it on a fit set of comparables, then price any protocol. */
+type CoreBuilder = (fitSet: Comparable[]) => (p: Protocol) => number;
+
+function coreFlat(fitSet: Comparable[]): (p: Protocol) => number {
+  const med = fitSet.length > 0 ? median(fitSet.map((c) => c.ratio)) : 0;
+  return (p) => p.tvl_usd * med;
+}
+function coreCurve(fitSet: Comparable[], offsets: boolean, withTilts: boolean, asOf: string, k: RadarConstants): (p: Protocol) => number {
+  const fit = fitCurve(fitSet, k);
+  const use: FittedCurve = offsets ? fit : { intercept: fit.intercept, slope: fit.slope, offsets: new Map(), peers: fit.peers };
+  return (p) => curveValue(use, p.tvl_usd, p.category) * (withTilts ? tilts(p, asOf, k) : 1);
+}
+
+/**
+ * The wider battery, all of it on the cleaned comparables (positively priced, no CEX, no Chain):
+ * leave-one-out for the whole ladder from a flat multiple to the full model; a time split that fits
+ * only tokens listed before 2024 and prices the ones listed since; the slug-hash split in both
+ * directions, the full model against the version-3.0 recipe (fit on every priced peer, CEX and
+ * Chain included); and the full model's leave-one-out errors split by the test token's age.
+ */
+export function validateV3(snapshot: Snapshot, k: RadarConstants = CONSTANTS): ValidationSuite {
+  const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
+  const all = marketRates(snapshot, k).comparables;
+  const priced = all.filter((c) => c.mcap_usd > 0 && c.tvl_usd > 0);
+  const clean = fitComparables(all);
+  const asOf = snapshot.as_of;
+  const full: CoreBuilder = (fitSet) => coreCurve(fitSet, true, true, asOf, k);
+  const v3Style: CoreBuilder = (fitSet) => {
+    void fitSet;
+    return coreCurve(priced, true, true, asOf, k);
+  };
+  void v3Style;
+  const ladder: { name: string; build: CoreBuilder }[] = [
+    { name: 'flat multiple', build: (f) => coreFlat(f) },
+    { name: 'size curve', build: (f) => coreCurve(f, false, false, asOf, k) },
+    { name: 'curve + category', build: (f) => coreCurve(f, true, false, asOf, k) },
+    { name: 'full model (curve + category + tilts)', build: (f) => coreCurve(f, true, true, asOf, k) },
+  ];
+  const err = (build: CoreBuilder, fitSet: Comparable[], testSet: Comparable[]): number[] => {
+    const price = build(fitSet);
+    const out: number[] = [];
+    for (const c of testSet) {
+      const p = bySlug.get(c.slug);
+      if (p === undefined) continue;
+      const pred = price(p);
+      if (pred > 0 && c.mcap_usd > 0) out.push(Math.abs(Math.log(pred / c.mcap_usd)));
+    }
+    return out;
+  };
+  // Leave-one-out over the clean set, for every rung of the ladder.
+  const loo: ValidationRow[] = ladder.map(({ name, build }) => {
+    const errors: number[] = [];
+    for (let i = 0; i < clean.length; i++) {
+      const fitSet = clean.filter((_, j) => j !== i);
+      errors.push(...err(build, fitSet, [clean[i]!]));
+    }
+    return metricsOf(errors, name);
+  });
+  // Age split of the full model's leave-one-out errors.
+  const youngErr: number[] = [];
+  const oldErr: number[] = [];
+  for (let i = 0; i < clean.length; i++) {
+    const age = ageInDays(asOf, clean[i]!.listed_at);
+    const e = err(full, clean.filter((_, j) => j !== i), [clean[i]!]);
+    if (age === null) continue;
+    (age < 548 ? youngErr : oldErr).push(...e);
+  }
+  // Time split: fit the past, price the future.
+  const past = clean.filter((c) => (c.listed_at ?? '9999') < '2024-01-01');
+  const future = clean.filter((c) => (c.listed_at ?? '0000') >= '2024-01-01');
+  const timeRows = ladder.map(({ name, build }) => metricsOf(err(build, past, future), name));
+  // Hash splits in both directions: the full model fitted on the clean half, against the v3.0
+  // recipe fitted on every priced peer in the same half.
+  const hashRows = (fitHalfPriced: Comparable[], testHalfPriced: Comparable[]): ValidationRow[] => {
+    const cleanFit = fitHalfPriced.filter((c) => clean.some((x) => x.slug === c.slug));
+    const cleanTest = testHalfPriced.filter((c) => clean.some((x) => x.slug === c.slug));
+    return [
+      metricsOf(err(full, cleanFit, cleanTest), 'full model, clean fit'),
+      metricsOf(err((f) => coreCurve(f, true, true, asOf, k), fitHalfPriced, cleanTest), 'v3.0 recipe, all priced peers'),
+    ];
+  };
+  const hA = priced.filter((c) => inFitHalf(c.slug));
+  const hB = priced.filter((c) => !inFitHalf(c.slug));
+  return {
+    loo,
+    time_split: { fit_n: past.length, test_n: future.length, rows: timeRows },
+    hash_a: hashRows(hA, hB),
+    hash_b: hashRows(hB, hA),
+    age_split: { young: metricsOf(youngErr, 'listed under 18 months ago'), old: metricsOf(oldErr, 'listed 18+ months ago') },
+  };
+}
+
+// ------------------------------------------------------------ bootstrap bands
+
+/** mulberry32: a tiny seeded generator, identical in Node and in the browser, so the bands reproduce. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** One row's uncertainty: the value band and the rank range over bootstrap refits of the curve. */
+export interface BandInfo {
+  lo: number;
+  hi: number;
+  rank_lo: number;
+  rank_hi: number;
+}
+
+const BOOTSTRAP_SEED = 0xc0ffee;
+export const BOOTSTRAP_REPS = 200;
+
+function quantile(sortedAsc: number[], q: number): number {
+  if (sortedAsc.length === 0) return 0;
+  const idx = Math.min(sortedAsc.length - 1, Math.max(0, Math.floor(q * sortedAsc.length)));
+  return sortedAsc[idx]!;
+}
+
+/**
+ * Refit the curve 200 times on resamples (with replacement) of the cleaned comparables and re-price
+ * the whole board each time. A row's band is the middle half of its refit prices; its rank range is
+ * the P10-P90 of its refit ranks. The tilts are the row's own and do not move between refits: what
+ * the band measures is the curve's uncertainty, which is the part the snapshot cannot settle.
+ */
+export function bootstrapBands(
+  scored: { p: Protocol; s: ScoreBreakdown }[],
+  cleanComps: Comparable[],
+  k: RadarConstants = CONSTANTS,
+  reps: number = BOOTSTRAP_REPS,
+): Map<string, BandInfo> {
+  const rng = mulberry32(BOOTSTRAP_SEED);
+  const values = new Map<string, number[]>();
+  const ranks = new Map<string, number[]>();
+  for (const { p } of scored) {
+    values.set(p.slug, []);
+    ranks.set(p.slug, []);
+  }
+  for (let r = 0; r < reps; r++) {
+    const sample: Comparable[] = [];
+    for (let i = 0; i < cleanComps.length; i++) sample.push(cleanComps[Math.floor(rng() * cleanComps.length)]!);
+    const fit = fitCurve(sample, k);
+    const priced = scored.map(({ p, s }) => ({
+      slug: p.slug,
+      v: curveValue(fit, p.tvl_usd, p.category) * s.momentum_mult * s.maturity_mult * s.breadth_mult,
+    }));
+    priced.sort((a, b) => b.v - a.v || (a.slug < b.slug ? -1 : 1));
+    priced.forEach((row, i) => {
+      values.get(row.slug)!.push(row.v);
+      ranks.get(row.slug)!.push(i + 1);
+    });
+  }
+  const out = new Map<string, BandInfo>();
+  for (const { p, s } of scored) {
+    const vs = [...values.get(p.slug)!].sort((a, b) => a - b);
+    const rs = [...ranks.get(p.slug)!].sort((a, b) => a - b);
+    out.set(p.slug, {
+      lo: Math.max(1, Math.round(quantile(vs, 0.25) || s.implied_value_usd)),
+      hi: Math.max(1, Math.round(quantile(vs, 0.75) || s.implied_value_usd)),
+      rank_lo: Math.round(quantile(rs, 0.1)),
+      rank_hi: Math.round(quantile(rs, 0.9)),
+    });
+  }
+  return out;
 }
 
 // ------------------------------------------------------------ who gets ranked
@@ -595,6 +815,196 @@ export function farmPlan(p: Protocol, age: number | null): FarmStep[] {
   return steps;
 }
 
+// ------------------------------------------------------------ v4 plans and farm economics
+
+/** The stated economics every verdict is netted under; printed on the dashboard, never hidden. */
+export const ECON = {
+  /** Share of a launch assumed to reach depositors, the figure the top of this field states. */
+  airdrop_share: 0.1,
+  /** What idle dollars earn instead: the T-bill rate the forgone income is charged at. */
+  tbill_rate: 0.04,
+};
+
+/** One on-chain action's fee in dollars, the numeric twin of gasNote's words. */
+export function gasUsd(chain: string): number {
+  if (chain === 'Ethereum') return 8;
+  if (chain === 'Solana') return 0.05;
+  if (chain === 'Bitcoin') return 2;
+  if (CHEAP_L2.has(chain)) return 0.5;
+  if (chain === 'Binance' || chain === 'BNB Chain') return 0.3;
+  return 1;
+}
+
+/** The ticket a farm position takes, scaled to the pool: bigger books absorb bigger positions. */
+export function ticketFor(tvl: number): number {
+  if (tvl >= 1_000_000_000) return 5000;
+  if (tvl >= 250_000_000) return 2500;
+  if (tvl >= 50_000_000) return 1000;
+  if (tvl >= 15_000_000) return 500;
+  return 250;
+}
+
+const fmtUsd = (v: number): string =>
+  Math.abs(v) < 100 ? `$${v.toFixed(2)}` : `$${Math.round(v).toLocaleString('en-US')}`;
+
+/** One dated step of a v4 farm plan: when, what, what it costs in dollars, how long hands-on. */
+export interface PlanStep {
+  day: string;
+  action: string;
+  cost: string;
+  time: string;
+  /** Fees only (gas, bridge) in dollars; working capital is not a fee. Contingent steps carry 0. */
+  fee_usd: number;
+  /** Hands-on minutes; contingent steps carry 0 and say so. */
+  minutes: number;
+}
+
+/** A plan step as board.json carries it: one string, day then action then cost then time. */
+export function planStepString(step: PlanStep): string {
+  return `${step.day}: ${step.action} Cost: ${step.cost}. Time: ${step.time}.`;
+}
+
+/** The whole farm arithmetic for one row, every figure derived from the row's own record. */
+export interface FarmEconomics {
+  ticket_usd: number;
+  hold_days: number;
+  fees_usd: number;
+  forgone_usd: number;
+  minutes: number;
+  slice_usd: number;
+  slice_low_usd: number;
+  net_usd: number;
+  net_low_usd: number;
+  net_per_hour: number;
+  /** (fees + forgone) / slice, in per cent: how likely a launch has to be for the farm to break even. */
+  breakeven_pct: number;
+}
+
+/**
+ * A protocol's v4 farm plan: seven dated steps. Day 0 sets up, day 1 and day 3 make the two core
+ * moves (the category picks them, as before), weekly checks keep the position live, a midway step
+ * re-reads the rewards terms, a stop rule exits if the book shrinks 10% under today's TVL, and the
+ * last day withdraws. Every step carries its fee in dollars and its minutes, and the economics
+ * below are summed from these same steps — the plan and the verdict can never drift apart.
+ */
+export function farmPlanV3(p: Protocol, age: number | null, s: ScoreBreakdown, bandLo: number): { steps: PlanStep[]; econ: FarmEconomics } {
+  const chain = p.chains.length > 0 ? p.chains[0]! : 'its main chain';
+  const gas = gasUsd(chain);
+  const ticket = ticketFor(p.tvl_usd);
+  const hold = holdDaysFor(age);
+  const weeks = Math.max(1, Math.round(hold / 7));
+  const bridge = chain === 'Ethereum' ? 0 : 1;
+  const moves = coreMoves(p.category, p.name, chain, ticket);
+  const v = variantOf(p.slug);
+  const stopLevel = Math.round(p.tvl_usd * 0.9);
+  const steps: PlanStep[] = [
+    {
+      day: 'Day 0',
+      action:
+        v === 0
+          ? `Set up a fresh wallet for ${p.name} alone, fund it from your main wallet, and keep its seed phrase offline.`
+          : `Create a dedicated wallet for this farm, separate from your main funds, and store its seed phrase on paper.`,
+      cost: bridge > 0 ? `${fmtUsd(bridge)} bridge leg to ${chain}` : 'no bridge leg — the position opens on Ethereum',
+      time: '20 minutes',
+      fee_usd: bridge,
+      minutes: 20,
+    },
+    {
+      day: 'Day 1',
+      action: moves.first,
+      cost: `${fmtUsd(ticket)} of working capital plus ${fmtUsd(gas)} of gas`,
+      time: '30 minutes',
+      fee_usd: gas,
+      minutes: 30,
+    },
+    {
+      day: 'Day 3',
+      action: moves.second,
+      cost: `${fmtUsd(gas)} of gas`,
+      time: '20 minutes',
+      fee_usd: gas,
+      minutes: 20,
+    },
+    {
+      day: `Days 7–${hold}`,
+      action: `Check ${p.name}'s TVL and its own rewards page once a week (${weeks} checks): the position only counts while it stays live, and the terms of a launch are announced there first.`,
+      cost: 'nothing',
+      time: `10 minutes a week, ${weeks * 10} minutes in all`,
+      fee_usd: 0,
+      minutes: weeks * 10,
+    },
+    {
+      day: `Day ${Math.round(hold / 2)}`,
+      action: `Midway re-read: confirm the rewards or points terms still match day 1, and top the position back up to ${fmtUsd(ticket)} if redemptions or price moves shrank it.`,
+      cost: `${fmtUsd(gas)} of gas if you top up`,
+      time: '15 minutes',
+      fee_usd: gas,
+      minutes: 15,
+    },
+    {
+      day: 'Any day',
+      action: `Stop rule: if ${p.name}'s TVL falls under ${fmtUsd(stopLevel)} — 10% below today's ${fmtUsd(p.tvl_usd)} — withdraw everything; a token priced off a shrinking book is worth less than the gas to claim it.`,
+      cost: `${fmtUsd(2 * gas)} of gas to exit, only if the rule fires`,
+      time: '20 minutes, only if the rule fires',
+      fee_usd: 0,
+      minutes: 0,
+    },
+    {
+      day: `Day ${hold}`,
+      action: `Withdraw the position in full, and claim any distribution only from a link ${p.name} itself publishes; never pay a fee to claim. Keep the farm log — wallet, dates, amounts, hashes — either way.`,
+      cost: `${fmtUsd(2 * gas)} of gas`,
+      time: '25 minutes',
+      fee_usd: 2 * gas,
+      minutes: 25,
+    },
+  ];
+  const fees = steps.reduce((a, st) => a + st.fee_usd, 0);
+  const minutes = steps.reduce((a, st) => a + st.minutes, 0);
+  const forgone = (ticket * ECON.tbill_rate * hold) / 365;
+  const slice = p.tvl_usd > 0 ? (ECON.airdrop_share * s.implied_value_usd * ticket) / p.tvl_usd : 0;
+  const sliceLow = p.tvl_usd > 0 ? (ECON.airdrop_share * bandLo * ticket) / p.tvl_usd : 0;
+  const net = slice - fees - forgone;
+  const netLow = sliceLow - fees - forgone;
+  const econ: FarmEconomics = {
+    ticket_usd: ticket,
+    hold_days: hold,
+    fees_usd: round4(fees),
+    forgone_usd: round4(forgone),
+    minutes,
+    slice_usd: round4(slice),
+    slice_low_usd: round4(sliceLow),
+    net_usd: round4(net),
+    net_low_usd: round4(netLow),
+    net_per_hour: round4(minutes > 0 ? net / (minutes / 60) : 0),
+    breakeven_pct: round4(slice > 0 ? ((fees + forgone) / slice) * 100 : 999),
+  };
+  return { steps, econ };
+}
+
+/**
+ * The v4 verdict, netted in dollars under the stated assumptions: Farm only when the farm still
+ * pays at the low end of the row's own value band; Thin when it pays at the point estimate but
+ * not at the low end; Skip when it does not pay at all.
+ */
+export function econVerdict(e: FarmEconomics): { verdict: DashRow['verdict']; reason: string } {
+  if (e.net_low_usd > 0) {
+    return {
+      verdict: 'Farm',
+      reason: `nets ${fmtUsd(e.net_usd)} if a token launches, and still ${fmtUsd(e.net_low_usd)} at the band's low end — the fees and the forgone interest are covered either way`,
+    };
+  }
+  if (e.net_usd > 0) {
+    return {
+      verdict: 'Thin',
+      reason: `nets ${fmtUsd(e.net_usd)} at the point estimate but ${fmtUsd(e.net_low_usd)} at the band's low end — a small position only, sized so the low end cannot hurt`,
+    };
+  }
+  return {
+    verdict: 'Skip',
+    reason: `the plausible slice of ${fmtUsd(e.slice_usd)} does not cover ${fmtUsd(e.fees_usd)} of fees plus ${fmtUsd(e.forgone_usd)} of forgone interest — break-even needs a ${Math.round(e.breakeven_pct)}% launch chance`,
+  };
+}
+
 // ------------------------------------------------------------ the board
 
 /** One row of board.json: the ranked candidate and everything the gate asks of a row. */
@@ -611,6 +1021,12 @@ export interface BoardRow {
   on_watchlist: boolean;
   token_status: 'pre-token';
   implied_value_usd: number;
+  /** The middle half of this row's prices over 200 bootstrap refits of the curve. */
+  band_lo_usd: number;
+  band_hi_usd: number;
+  /** The P10–P90 of this row's rank over the same refits. */
+  rank_p10: number;
+  rank_p90: number;
   model: {
     category_multiple: number;
     category_median: number;
@@ -626,11 +1042,26 @@ export interface BoardRow {
 }
 
 /** A board row as the dashboard receives it: the same figures, with the plan in structured form. */
+/** A traded peer shown beside a candidate in the detail view: the market's own figures. */
+export interface PeerView {
+  name: string;
+  tvl_usd: number;
+  mcap_usd: number;
+  /** The peer's recorded market cap per dollar of TVL. */
+  multiple: number;
+}
+
 export interface DashRow extends Omit<BoardRow, 'farm_steps' | 'model'> {
   model: BoardRow['model'];
   farm: FarmStep[];
-  /** The radar's own call on the row, from its figures alone: farm it, watch it, or skip it. */
-  verdict: 'Farm' | 'Watch' | 'Skip';
+  /** The v4 dated plan the economics are summed from. */
+  plan: PlanStep[];
+  /** The farm arithmetic for this row, netted under the stated assumptions. */
+  econ: FarmEconomics;
+  /** The five traded peers nearest this row's TVL, for the detail view. */
+  peers: PeerView[];
+  /** The radar's own call on the row, netted in dollars: farm it, thin position, or skip it. */
+  verdict: 'Farm' | 'Thin' | 'Skip';
   /** Why the verdict is what it is, in one line a reader can check against the row. */
   verdict_reason: string;
 }
@@ -672,6 +1103,10 @@ export interface RadarData {
     board: number;
     early: number;
     comparables: number;
+    /** Priced peers with a positive cap: the set the v3.0 recipe fitted on. */
+    priced: number;
+    /** The cleaned set the v4 curve is fitted on (priced, minus CEX and Chain). */
+    fit_comparables: number;
     live_unpriced: number;
   };
   category_rates: CategoryRateView[];
@@ -679,6 +1114,15 @@ export interface RadarData {
   fit: { intercept: number; slope: number; peers: number };
   /** The out-of-sample race between the fitted curve and the median model, run on this snapshot. */
   validation: ModelValidation;
+  /** The wider v4 battery: leave-one-out ladder, time split, both hash directions, age split. */
+  validation3: ValidationSuite;
+  /** Why each pre-token protocol that is not on the board was set aside, with counts. */
+  set_aside: { reason: string; count: number }[];
+  /** The stated farm-economics assumptions every verdict is netted under. */
+  econ_constants: typeof ECON;
+  verdict_counts: { Farm: number; Thin: number; Skip: number };
+  /** The cleaned fit set's slugs, in snapshot order: the browser's recompute resamples exactly this list. */
+  fit_order: string[];
   rows: DashRow[];
   comparables: Comparable[];
 }
@@ -688,56 +1132,99 @@ export interface RadarData {
  * finds below it (the early rows the radar exists for), scored and ranked by implied value. Ties
  * break by slug so two runs of the same snapshot agree byte for byte.
  */
-export function buildBoard(snapshot: Snapshot, rates: MarketRates, fit: FittedCurve, k: RadarConstants = CONSTANTS): { rows: BoardRow[]; plans: Map<string, FarmStep[]> } {
+export function buildBoard(snapshot: Snapshot, rates: MarketRates, fit: FittedCurve, k: RadarConstants = CONSTANTS): { rows: BoardRow[]; plans: Map<string, PlanStep[]>; econs: Map<string, FarmEconomics> } {
   const watch = new Set(snapshot.watchlist);
   const chosen = snapshot.protocols.filter((p) => watch.has(p.slug) || isCandidate(p));
-  const scored = chosen.map((p) => ({ p, s: score(p, snapshot.as_of, rates, fit, k), plan: farmPlan(p, ageInDays(snapshot.as_of, p.listed_at)) }));
+  const scored = chosen.map((p) => ({ p, s: score(p, snapshot.as_of, rates, fit, k) }));
   scored.sort((a, b) => b.s.implied_value_usd - a.s.implied_value_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  const plans = new Map(scored.map(({ p, plan }) => [p.slug, plan]));
-  const rows = scored.map(({ p, s, plan }, i) => ({
-    rank: i + 1,
-    slug: p.slug,
-    name: p.name,
-    category: p.category,
-    chains: p.chains,
-    tvl_usd: p.tvl_usd,
-    change_7d: p.change_7d,
-    listed_at: p.listed_at,
-    age_days: s.age_days,
-    on_watchlist: watch.has(p.slug),
-    token_status: 'pre-token',
-    implied_value_usd: s.implied_value_usd,
-    model: {
-      category_multiple: s.multiple,
-      category_median: s.category_median,
-      category_peers: s.peers,
-      curve_multiple: s.curve_multiple,
-      category_offset: s.category_offset,
-      growth_pct: s.growth_pct,
-      momentum_multiplier: s.momentum_mult,
-      maturity_multiplier: s.maturity_mult,
-      breadth_multiplier: s.breadth_mult,
-    },
-    farm_steps: plan.map(stepString),
-  }));
-  return { rows, plans };
+  const bands = bootstrapBands(scored, fitComparables(rates.comparables), k);
+  const plans = new Map<string, PlanStep[]>();
+  const econs = new Map<string, FarmEconomics>();
+  const rows = scored.map(({ p, s }, i) => {
+    const band = bands.get(p.slug) ?? { lo: s.implied_value_usd, hi: s.implied_value_usd, rank_lo: i + 1, rank_hi: i + 1 };
+    const { steps, econ } = farmPlanV3(p, s.age_days, s, band.lo);
+    plans.set(p.slug, steps);
+    econs.set(p.slug, econ);
+    return {
+      rank: i + 1,
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl_usd: p.tvl_usd,
+      change_7d: p.change_7d,
+      listed_at: p.listed_at,
+      age_days: s.age_days,
+      on_watchlist: watch.has(p.slug),
+      token_status: 'pre-token',
+      implied_value_usd: s.implied_value_usd,
+      band_lo_usd: band.lo,
+      band_hi_usd: band.hi,
+      rank_p10: band.rank_lo,
+      rank_p90: band.rank_hi,
+      model: {
+        category_multiple: s.multiple,
+        category_median: s.category_median,
+        category_peers: s.peers,
+        curve_multiple: s.curve_multiple,
+        category_offset: s.category_offset,
+        growth_pct: s.growth_pct,
+        momentum_multiplier: s.momentum_mult,
+        maturity_multiplier: s.maturity_mult,
+        breadth_multiplier: s.breadth_mult,
+      },
+      farm_steps: steps.map(planStepString),
+    };
+  });
+  return { rows, plans, econs };
 }
 
 /** Assemble everything: the board for board.json and the dashboard's dataset, from one pass. */
 export function buildRadar(snapshot: Snapshot, k: RadarConstants = CONSTANTS): { board: BoardRow[]; radar: RadarData } {
   const rates = marketRates(snapshot, k);
-  const fit = fitCurve(rates.comparables, k);
-  const { rows: board, plans } = buildBoard(snapshot, rates, fit, k);
+  const clean = fitComparables(rates.comparables);
+  const fit = fitCurve(clean, k);
+  const { rows: board, plans, econs } = buildBoard(snapshot, rates, fit, k);
   const watch = new Set(snapshot.watchlist);
+  const priced = rates.comparables.filter((c) => c.mcap_usd > 0 && c.tvl_usd > 0);
+  const peersFor = (tvl: number): PeerView[] =>
+    [...clean]
+      .sort((a, b) => Math.abs(Math.log(a.tvl_usd / tvl)) - Math.abs(Math.log(b.tvl_usd / tvl)))
+      .slice(0, 5)
+      .map((c) => ({ name: c.name, tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd, multiple: round4(c.mcap_usd / c.tvl_usd) }));
   const rows: DashRow[] = board.map((r) => {
     const { farm_steps, ...rest } = r;
     void farm_steps;
-    const v = verdictFor({ implied_value_usd: r.implied_value_usd, growth_pct: r.model.growth_pct });
-    return { ...rest, farm: plans.get(r.slug)!, verdict: v.verdict, verdict_reason: v.reason };
+    const econ = econs.get(r.slug)!;
+    const v = econVerdict(econ);
+    const plan = plans.get(r.slug)!;
+    return {
+      ...rest,
+      farm: plan.map((st) => ({ action: st.action, cost: st.cost, time: st.time })),
+      plan,
+      econ,
+      peers: peersFor(r.tvl_usd),
+      verdict: v.verdict,
+      verdict_reason: v.reason,
+    };
   });
   const categoryRates: CategoryRateView[] = [...rates.by_category.values()]
     .map((r) => ({ category: r.category === '' ? 'Uncategorised' : r.category, peers: r.peers, median_ratio: r.median_ratio, multiple: r.multiple }))
     .sort((a, b) => b.peers - a.peers || (a.category < b.category ? -1 : 1));
+  // The set-aside ledger: every pre-token protocol that is neither watchlist nor candidate, with
+  // the first reason the candidate filter refuses it. The counts must sum to the gap between the
+  // record-no-token universe and the board, and the dashboard prints them so they can be checked.
+  const asideCounts = new Map<string, number>();
+  for (const p of snapshot.protocols) {
+    if (!recordsNoToken(p) || watch.has(p.slug) || isCandidate(p)) continue;
+    let reason = 'another filter reason';
+    if (p.category !== null && CONDUIT_CATEGORIES.has(p.category)) reason = `conduit or wrapper category (${p.category})`;
+    else if (VERSION_SUFFIX.test(p.name)) reason = 'name carries a version suffix — a redeployment, not a launch';
+    else if (WRAPPER_WORD.test(p.name)) reason = 'name marks a wrapped or staked product of another asset';
+    else if (EXCHANGE_PREFIXES.some((x) => p.name.startsWith(x))) reason = "name begins with an exchange's name — a house product";
+    asideCounts.set(reason, (asideCounts.get(reason) ?? 0) + 1);
+  }
+  const setAside = [...asideCounts.entries()].map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -751,11 +1238,22 @@ export function buildRadar(snapshot: Snapshot, k: RadarConstants = CONSTANTS): {
       board: board.length,
       early: board.filter((r) => !watch.has(r.slug)).length,
       comparables: rates.comparables.length,
+      priced: priced.length,
+      fit_comparables: clean.length,
       live_unpriced: snapshot.protocols.filter((p) => !recordsNoToken(p) && p.mcap_usd === null).length,
     },
     category_rates: categoryRates,
     fit: { intercept: fit.intercept, slope: fit.slope, peers: fit.peers },
     validation: validateModels(snapshot, k),
+    validation3: validateV3(snapshot, k),
+    set_aside: setAside,
+    econ_constants: ECON,
+    verdict_counts: {
+      Farm: rows.filter((r) => r.verdict === 'Farm').length,
+      Thin: rows.filter((r) => r.verdict === 'Thin').length,
+      Skip: rows.filter((r) => r.verdict === 'Skip').length,
+    },
+    fit_order: clean.map((c) => c.slug),
     rows,
     comparables: [...rates.comparables].sort(
       (a, b) => (a.category ?? '') < (b.category ?? '') ? -1 : (a.category ?? '') > (b.category ?? '') ? 1 : b.ratio - a.ratio,
