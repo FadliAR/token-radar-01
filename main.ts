@@ -15,11 +15,15 @@ import { fileURLToPath } from "node:url";
 import { buildDossier } from "./vendor/makefun-board.ts";
 import {
   AIRDROP_SHARE,
+  CONDUIT_CATEGORIES,
+  VERSION_SUFFIX,
+  WRAPPED_WORD,
   ageDays,
   bootstrapBands,
   classifyUniverse,
   economicsFor,
   fitCurve,
+  fnv1a,
   homeChain,
   planFor,
   priceWith,
@@ -141,6 +145,13 @@ const scoreRow = (label: string, s: Score): [string, number, number, number, num
   Math.round(s.within3 * 100),
   s.n,
 ];
+const asideKind = (p: ProtocolRec): number => {
+  if (p.category !== null && CONDUIT_CATEGORIES.includes(p.category)) return 0;
+  if (VERSION_SUFFIX.test(p.name)) return 1;
+  if (WRAPPED_WORD.test(p.name)) return 2;
+  return 3;
+};
+const planHash = fnv1a(rows.map((row) => row.steps.join("\n")).join("\n"));
 const data = {
   m: {
     asOf,
@@ -181,10 +192,10 @@ const data = {
     ],
     spearman: roundTo(validation.spearmanLoo, 3),
     top20: validation.top20Overlap,
+    planHash,
     cats: categories,
   },
   p: uni.pricedPeers.map((p) => [
-    p.slug,
     p.tvl_usd,
     p.mcap_usd,
     catOf(p),
@@ -207,12 +218,13 @@ const data = {
     row.band.p75,
     row.band.rankLo,
     row.band.rankHi,
+    row.verdict === "Farm" ? 0 : row.verdict === "Thin" ? 1 : 2,
   ]),
   s: uni.setAside.map((entry) => [
     entry.rec.name,
     catOf(entry.rec),
     entry.rec.tvl_usd,
-    entry.reason,
+    asideKind(entry.rec),
   ]),
 };
 const dataJs =

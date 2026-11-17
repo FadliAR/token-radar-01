@@ -104,6 +104,25 @@ export function roundTo(x: number, dp: number): number {
   return Math.round(x * f) / f;
 }
 
+// Round to 3 significant figures: the precision bands are reported at, in
+// the data file and on the page alike.
+export function roundSig3(x: number): number {
+  if (x === 0) return 0;
+  const d = Math.ceil(Math.log10(Math.abs(x)));
+  return roundTo(x, 3 - d);
+}
+
+// FNV-1a over UTF-16 code units: a consistency checksum the dashboard
+// recomputes over its own generated plan texts.
+export function fnv1a(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
 // ---------------------------------------------------------------------------
 // Universe classification: the set-aside ledger. Every one of the snapshot's
 // 758 protocols lands in exactly one class, and the classes reconcile:
@@ -598,8 +617,8 @@ export function bootstrapBands(
     const vs = [...(values.get(r.slug) as number[])].sort((x, y) => x - y);
     const rs = [...(ranks.get(r.slug) as number[])].sort((x, y) => x - y);
     out.set(r.slug, {
-      p25: Math.round(quantile(vs, 0.25)),
-      p75: Math.round(quantile(vs, 0.75)),
+      p25: roundSig3(quantile(vs, 0.25)),
+      p75: roundSig3(quantile(vs, 0.75)),
       rankLo: Math.round(quantile(rs, 0.1)),
       rankHi: Math.round(quantile(rs, 0.9)),
     });

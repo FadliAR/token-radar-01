@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Launch Radar — implied values for pre-token protocols</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <h1>Token Launch Radar</h1>
+  <p class="sub" id="subline">Implied launch values for protocols that record no token yet,
+  priced off the ones whose tokens already trade.</p>
+  <nav>
+    <a href="#board" id="nav-board">Board</a>
+    <a href="#method" id="nav-method">Method &amp; evidence</a>
+  </nav>
+  <p class="badge" id="badge">Recomputing the board from the shipped data…</p>
+</header>
+<main>
+  <section id="view-board">
+    <div class="strip" id="strip"></div>
+    <div class="controls">
+      <input type="search" id="q" placeholder="Search name or slug">
+      <select id="fcat"><option value="">All categories</option></select>
+      <select id="fver">
+        <option value="">All verdicts</option>
+        <option>Farm</option><option>Thin</option><option>Skip</option>
+      </select>
+      <label class="chk"><input type="checkbox" id="fwatch"> Watchlist only</label>
+      <span class="count" id="count"></span>
+    </div>
+    <table id="board">
+      <thead><tr>
+        <th>#</th><th>Protocol</th><th>Category</th><th class="num">TVL</th>
+        <th class="num">7d %</th><th class="num">Implied value</th><th>Band P25–P75</th>
+        <th>Rank range</th><th>Verdict</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="note">Band = P25–P75 of the row's value across 200 seeded bootstrap refits of the
+    cleaned peer set; rank range = P10–P90 of its rank across the same refits. Verdicts are farm
+    economics netted in dollars at the band low (Farm), the point estimate only (Thin), or not at
+    all (Skip) — definitions and counts on the Method view. Click a row for the full working.</p>
+  </section>
+  <section id="view-detail" hidden></section>
+  <section id="view-method" hidden></section>
+</main>
+<footer>
+  <p>Every number on this page is re-derived in your browser from the shipped data file and
+  compared against the board the program wrote; the badge above reports the result. Bands,
+  verdicts and plans are computed, not asserted.</p>
+</footer>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
