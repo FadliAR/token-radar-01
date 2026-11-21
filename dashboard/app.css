@@ -74,7 +74,7 @@ tbody tr:hover { background: var(--panel2); }
 .pill.skip { background: var(--panel2); color: var(--muted); border: 1px solid var(--line); }
 .count { color: var(--muted); font-size: 13px; }
 .detail {
-  margin-top: 18px; background: var(--panel); border: 1px solid var(--amber);
+  margin: 6px 0 18px; background: var(--panel); border: 1px solid var(--amber);
   border-radius: 12px; padding: 18px 22px; max-width: 980px;
 }
 .detail h2 { margin: 0 0 2px; font-size: 22px; }
@@ -86,6 +86,9 @@ tbody tr:hover { background: var(--panel2); }
 .detail ol { margin: 8px 0 4px; padding-left: 20px; }
 .detail li { margin: 5px 0; }
 footer { padding: 0 32px 28px; color: var(--muted); max-width: 980px; font-size: 13px; }
+body.detail-mode header, body.detail-mode .stats, body.detail-mode .about,
+body.detail-mode table, body.detail-mode .count { display: none; }
+body.detail-mode .detail { margin-top: 14px; }
 @media (max-width: 760px) {
   header, .stats, .about, .controls, main, footer { padding-left: 16px; padding-right: 16px; }
   header { flex-direction: column; }

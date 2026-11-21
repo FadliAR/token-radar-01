@@ -122,7 +122,7 @@ function visible() {
 function render() {
   const out = visible();
   tbody.innerHTML = out.map((r) => {
-    const ch = r.change === "" ? "—" : `<span class="${r.change >= 0 ? "pos" : "neg"}">${r.change >= 0 ? "+" : ""}${r.change}%</span>`;
+    const ch = r.change === "" ? "—" : `<span class="${r.change >= 0 ? "pos" : "neg"}">${r.change >= 0 ? "+" : ""}${r.change.toFixed(2)}%</span>`;
     return `<tr data-slug="${r.slug}"><td>${r.rank}</td>`
       + `<td class="name">${r.name}${r.wl ? '<span class="wl-dot">watchlist</span>' : ""}</td>`
       + `<td>${r.category}</td><td>${money(r.tvl)}</td><td>${ch}</td>`
@@ -134,6 +134,7 @@ function render() {
     tr.addEventListener("click", () => openDetail(tr.dataset.slug));
   }
 }
+let noScroll = false;
 function openDetail(slug) {
   const r = rows.find((x) => x.slug === slug);
   if (!r) return;
@@ -145,10 +146,10 @@ function openDetail(slug) {
     + `<dl>`
     + `<div><dt>Band (bootstrap 5–95%)</dt><dd>${money(r.lo)} – ${money(r.hi)}</dd></div>`
     + `<div><dt>TVL</dt><dd>${money(r.tvl)}</dd></div>`
-    + `<div><dt>7-day change</dt><dd>${r.change === "" ? "not reported" : r.change + "%"}</dd></div>`
+    + `<div><dt>7-day change</dt><dd>${r.change === "" ? "not reported" : r.change.toFixed(2) + "%"}</dd></div>`
     + `<div><dt>Verdict</dt><dd>${VERDICTS[r.verdict]} — expected reward ${money(r.reward)} at the band low vs ${money(r.cost)} of farming cost over ${M.weeks} weeks</dd></div>`
     + `</dl><h3>Farm plan</h3><ol>${steps}</ol>`;
-  detail.scrollIntoView({ block: "nearest" });
+  if (!noScroll) detail.scrollIntoView({ block: "start" });
 }
 document.getElementById("q").addEventListener("input", render);
 document.getElementById("sort").addEventListener("change", (e) => { sortKey = e.target.value; render(); });
@@ -172,4 +173,10 @@ if (hash.get("v")) {
     render();
   }
 }
-if (hash.get("d")) openDetail(hash.get("d"));
+if (hash.get("d")) {
+  // A deep link to one protocol opens in a focused detail mode: the
+  // panel sits at the top, the board one click of "All verdicts" away.
+  noScroll = true;
+  document.body.classList.add("detail-mode");
+  openDetail(hash.get("d"));
+}
