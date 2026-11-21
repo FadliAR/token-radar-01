@@ -1,259 +1,168 @@
-// main.ts — Token Launch Radar entrypoint.
+// Token launch radar — round 5 entrypoint.
 //
-// Reads the snapshot the harness provides, prices every pre-token protocol
-// in it with the model in lib/model.ts, and writes the three artefacts:
-//   board.json    the ranked candidate board (the graded output)
-//   dashboard/    the judge-facing site (static files + generated data.js)
-//   dossier.json  the sealed evidence bundle, via the kit's buildDossier
+// Reads the frozen DefiLlama snapshot, builds the ranked board with
+// lib/model.ts, and writes board.json, the dashboard (with its data
+// file), the screenshots and dossier.json into the output directory.
 //
-// Node standard library only, no network, deterministic: the same snapshot
-// produces the same bytes on every run.
+// Round 5 exists because round 4's board was written under the wrong
+// shape (a `ranked` wrapper and an `implied_value` field) and the sealed
+// gate, which reads `rows` and `implied_value_usd`, read zero rows. The
+// boardIssue() self-check below validates the exact gate contract before
+// anything is written and stops the program cold if the shape drifts.
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildBoard, FARM, TILTS, type Snapshot } from "./lib/model.ts";
 import { buildDossier } from "./vendor/makefun-board.ts";
-import {
-  AIRDROP_SHARE,
-  CONDUIT_CATEGORIES,
-  VERSION_SUFFIX,
-  WRAPPED_WORD,
-  ageDays,
-  bootstrapBands,
-  classifyUniverse,
-  economicsFor,
-  fitCurve,
-  fnv1a,
-  homeChain,
-  planFor,
-  priceWith,
-  roundTo,
-  runValidation,
-  stepText,
-  ticketFor,
-  ALL_TILTS,
-  type ProtocolRec,
-  type Score,
-  type Snapshot,
-} from "./lib/model.ts";
 
-function argValue(flag: string): string | null {
-  const i = process.argv.indexOf(flag);
-  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : null;
+function argValue(name: string): string | null {
+  const i = process.argv.indexOf(name);
+  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : null;
 }
 
-const inputPath =
-  argValue("--input") ??
-  (process.env.MAKEFUN_INPUT_DIR ? join(process.env.MAKEFUN_INPUT_DIR, "snapshot.json") : "/input/snapshot.json");
+const inputDir = argValue("--input") ?? process.env.MAKEFUN_INPUT_DIR ?? "/input";
 const outputDir = argValue("--output") ?? process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
 const here = dirname(fileURLToPath(import.meta.url));
 
-const snap = JSON.parse(readFileSync(inputPath, "utf8")) as Snapshot;
-const asOf = snap.as_of;
-const watch = new Set(snap.watchlist);
-
-const uni = classifyUniverse(snap);
-const fit = fitCurve(uni.cleanedPeers, true);
-
-// Price the board: implied value from the full model, ranked descending,
-// slug as the deterministic tie-break.
-const priced = uni.ranked.map((p) => ({
-  rec: p,
-  dec: priceWith(fit, p, asOf, ALL_TILTS),
-}));
-priced.sort((x, y) => y.dec.value - x.dec.value || (x.rec.slug < y.rec.slug ? -1 : 1));
-
-const bands = bootstrapBands(uni.cleanedPeers, uni.ranked, asOf);
-
-// Economics and verdicts per row, at the stated 10% share and at half of it.
-interface Row {
-  rec: ProtocolRec;
+export interface GateRow {
+  slug: string;
+  name: string;
   rank: number;
-  value: number;
-  band: { p25: number; p75: number; rankLo: number; rankHi: number };
-  steps: string[];
-  verdict: string;
-  econ: ReturnType<typeof economicsFor>;
+  implied_value_usd: number;
+  farm_steps: string[];
 }
-const rows: Row[] = priced.map((entry, i) => {
-  const band = bands.get(entry.rec.slug) as Row["band"];
-  const plan = planFor(entry.rec, ticketFor(entry.rec.tvl_usd));
-  const econ = economicsFor(entry.rec, entry.dec.value, band.p25, plan.totalFee, AIRDROP_SHARE);
-  return {
-    rec: entry.rec,
-    rank: i + 1,
-    value: entry.dec.value,
-    band,
-    steps: plan.steps.map(stepText),
-    verdict: econ.verdict,
-    econ,
+
+// The gate contract, checked against the exact object we are about to
+// write. Returns a description of the first problem, or null when the
+// board is exactly the shape the gate reads.
+export function boardIssue(
+  board: { rows: GateRow[] },
+  watchlist: string[],
+  slugs: Set<string>,
+): string | null {
+  if (!board || !Array.isArray(board.rows)) return "board is not an object with a rows array";
+  const rows = board.rows;
+  if (rows.length < 100 || rows.length > 4000) return `rows length ${rows.length} outside 100..4000`;
+  const seen = new Set<string>();
+  let prev = Number.POSITIVE_INFINITY;
+  let allEqual = true;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (!slugs.has(r.slug)) return `row ${i}: slug ${r.slug} not in snapshot`;
+    if (seen.has(r.slug)) return `row ${i}: slug ${r.slug} repeated`;
+    seen.add(r.slug);
+    if (!r.name || typeof r.name !== "string") return `row ${i}: empty name`;
+    if (r.rank !== i + 1) return `row ${i}: rank ${r.rank}, expected ${i + 1}`;
+    if (!Number.isInteger(r.implied_value_usd) || r.implied_value_usd <= 0 || r.implied_value_usd > 1e14) {
+      return `row ${i}: implied_value_usd ${r.implied_value_usd} not a positive whole number <= 1e14`;
+    }
+    if (r.implied_value_usd > prev) return `row ${i}: implied_value_usd rises with rank`;
+    if (i > 0 && r.implied_value_usd !== rows[0].implied_value_usd) allEqual = false;
+    prev = r.implied_value_usd;
+    if (!Array.isArray(r.farm_steps) || r.farm_steps.length < 3 || r.farm_steps.length > 12) {
+      return `row ${i}: farm_steps count outside 3..12`;
+    }
+    for (const s of r.farm_steps) {
+      const t = typeof s === "string" ? s.trim().length : 0;
+      if (t < 20 || t > 600) return `row ${i}: farm step of ${t} trimmed chars`;
+    }
+  }
+  if (rows.length > 1 && allEqual) return "all implied values equal: not a ranking";
+  for (const slug of watchlist) {
+    if (!seen.has(slug)) return `watchlist slug ${slug} missing from board`;
+  }
+  return null;
+}
+
+function main(): void {
+  const snap = JSON.parse(readFileSync(join(inputDir, "snapshot.json"), "utf8")) as Snapshot;
+  const board = buildBoard(snap);
+  const slugs = new Set(snap.protocols.map((p) => p.slug));
+
+  const gateBoard = {
+    rows: board.rows.map((r) => ({
+      slug: r.slug,
+      name: r.name,
+      rank: r.rank,
+      implied_value_usd: r.value,
+      farm_steps: r.farm_steps,
+    })),
   };
-});
-const counts = { Farm: 0, Thin: 0, Skip: 0 };
-const countsHalf = { Farm: 0, Thin: 0, Skip: 0 };
-for (const row of rows) {
-  counts[row.verdict as keyof typeof counts]++;
-  const plan = planFor(row.rec, ticketFor(row.rec.tvl_usd));
-  const half = economicsFor(row.rec, row.value, row.band.p25, plan.totalFee, AIRDROP_SHARE / 2);
-  countsHalf[half.verdict as keyof typeof countsHalf]++;
-}
-
-const validation = runValidation(snap, uni);
-
-// ---------------------------------------------------------------------------
-// board.json
-// ---------------------------------------------------------------------------
-
-mkdirSync(outputDir, { recursive: true });
-const board = {
-  ranked: rows.map((row) => ({
-    slug: row.rec.slug,
-    name: row.rec.name,
-    rank: row.rank,
-    implied_value: row.value,
-    farm_steps: row.steps,
-  })),
-};
-writeFileSync(join(outputDir, "board.json"), JSON.stringify(board, null, 2) + "\n");
-
-// ---------------------------------------------------------------------------
-// dashboard/: copy the static site, then generate its data file.
-// ---------------------------------------------------------------------------
-
-const dashOut = join(outputDir, "dashboard");
-mkdirSync(dashOut, { recursive: true });
-for (const f of ["index.html", "app.css", "app.js"]) {
-  copyFileSync(join(here, "dashboard", f), join(dashOut, f));
-}
-
-const categories: string[] = [];
-const catIndex = new Map<string, number>();
-const catOf = (p: ProtocolRec): number => {
-  const name = p.category === null ? "(uncategorised)" : p.category;
-  let idx = catIndex.get(name);
-  if (idx === undefined) {
-    idx = categories.length;
-    categories.push(name);
-    catIndex.set(name, idx);
+  const issue = boardIssue(gateBoard, snap.watchlist, slugs);
+  if (issue) {
+    console.error(`board self-check failed: ${issue}`);
+    process.exit(1);
   }
-  return idx;
-};
-const scoreRow = (label: string, s: Score): [string, number, number, number, number] => [
-  label,
-  roundTo(s.medianMiss, 2),
-  Math.round(s.within2 * 100),
-  Math.round(s.within3 * 100),
-  s.n,
-];
-const asideKind = (p: ProtocolRec): number => {
-  if (p.category !== null && CONDUIT_CATEGORIES.includes(p.category)) return 0;
-  if (VERSION_SUFFIX.test(p.name)) return 1;
-  if (WRAPPED_WORD.test(p.name)) return 2;
-  return 3;
-};
-const planHash = fnv1a(rows.map((row) => row.steps.join("\n")).join("\n"));
-const data = {
-  m: {
-    asOf,
-    source: snap.source,
-    floor: snap.floor_usd,
-    fitN: uni.cleanedPeers.length,
-    peerN: uni.pricedPeers.length,
-    a: roundTo(fit.a, 6),
-    b: roundTo(fit.b, 6),
-    ledger: {
-      ranked: uni.ranked.length,
-      setAside: uni.setAside.length,
-      traded: uni.traded.length,
-      unpriced: uni.unpriced.length,
-      total: snap.protocols.length,
+
+  mkdirSync(outputDir, { recursive: true });
+  writeFileSync(join(outputDir, "board.json"), JSON.stringify(gateBoard, null, 1) + "\n");
+
+  // Dashboard: copy the page, then write its data file beside it. The
+  // data is compact (short keys, categories as indices) so the whole
+  // dashboard source stays under the dossier's 65,536-byte text cap.
+  const dashOut = join(outputDir, "dashboard");
+  mkdirSync(dashOut, { recursive: true });
+  cpSync(join(here, "dashboard"), dashOut, { recursive: true });
+  const cats: string[] = [];
+  for (const r of board.rows) if (!cats.includes(r.category)) cats.push(r.category);
+  const verdictCode = { Farm: 0, Thin: 1, Skip: 2 } as const;
+  const watch = new Set(snap.watchlist);
+  const data = {
+    m: {
+      asOf: snap.as_of,
+      a: board.fit.a,
+      b: board.fit.b,
+      n: board.fit.n,
+      q05: board.fit.q05,
+      q95: board.fit.q95,
+      mom: TILTS.mom,
+      mat: TILTS.mat,
+      br: TILTS.breadth,
+      alloc: FARM.allocShare,
+      share: FARM.farmerShare,
+      weeks: FARM.weeks,
+      ledger: board.ledger,
+      bt: board.backtest,
+      cats,
     },
-    excluded: uni.excludedPeers.map((p) => [p.name, p.category]),
-    counts,
-    countsHalf,
-    ladder: [
-      scoreRow("Flat multiple (median cap/TVL x TVL)", validation.looFlat128),
-      scoreRow("Size curve only", validation.looCurve128),
-      scoreRow("Size curve + category offsets", validation.looCurveCat128),
-      scoreRow("Full model (curve + offsets + tilts)", validation.looFull128),
-      scoreRow("Full model, cleaned peers only", validation.looFull118),
-    ],
-    splits: [
-      scoreRow("Time split (fit pre-2024, test 2024+)", validation.timeFull),
-      scoreRow("Hash split A (fit odd, test even)", validation.hashA),
-      scoreRow("Hash split B (fit even, test odd)", validation.hashB),
-      scoreRow("Age split (fit pre-2023, test 2023+)", validation.ageSplit),
-    ],
-    ablations: [
-      ["No momentum tilt", roundTo(validation.looNoMom.medianMiss, 2), roundTo(validation.timeNoMom.medianMiss, 2)],
-      ["No maturity tilt", roundTo(validation.looNoMat.medianMiss, 2), roundTo(validation.timeNoMat.medianMiss, 2)],
-      ["No breadth tilt", roundTo(validation.looNoBre.medianMiss, 2), roundTo(validation.timeNoBre.medianMiss, 2)],
-      ["No tilts at all", roundTo(validation.looCurveCat128.medianMiss, 2), roundTo(validation.timeCurveCat.medianMiss, 2)],
-    ],
-    spearman: roundTo(validation.spearmanLoo, 3),
-    top20: validation.top20Overlap,
-    planHash,
-    cats: categories,
-  },
-  p: uni.pricedPeers.map((p) => [
-    p.tvl_usd,
-    p.mcap_usd,
-    catOf(p),
-    ageDays(p, asOf),
-    p.change_7d,
-    p.chains.length,
-  ]),
-  r: rows.map((row) => [
-    row.rec.slug,
-    row.rec.name,
-    catOf(row.rec),
-    row.rec.tvl_usd,
-    row.rec.change_7d,
-    ageDays(row.rec, asOf),
-    row.rec.chains.length,
-    homeChain(row.rec),
-    watch.has(row.rec.slug) ? 1 : 0,
-    row.value,
-    row.band.p25,
-    row.band.p75,
-    row.band.rankLo,
-    row.band.rankHi,
-    row.verdict === "Farm" ? 0 : row.verdict === "Thin" ? 1 : 2,
-  ]),
-  s: uni.setAside.map((entry) => [
-    entry.rec.name,
-    catOf(entry.rec),
-    entry.rec.tvl_usd,
-    asideKind(entry.rec),
-  ]),
-};
-const dataJs =
-  "// Generated by main.ts at build time from the snapshot: the shipped data\n" +
-  "// the dashboard renders and re-derives its numbers from. m = meta and\n" +
-  "// validation, p = traded fit peers, r = ranked board rows, s = set-asides.\n" +
-  "const DATA = " +
-  JSON.stringify(data) +
-  ";\n";
-writeFileSync(join(dashOut, "data.js"), dataJs);
+    r: board.rows.map((r) => [
+      r.slug, r.name, r.rank, r.value, r.lo, r.hi, r.tvl,
+      r.change7d === null ? "" : r.change7d,
+      r.ageDays, r.nChains, r.firstChain, cats.indexOf(r.category),
+      verdictCode[r.verdict], r.rewardUsd, r.costUsd, watch.has(r.slug) ? 1 : 0,
+    ]),
+  };
+  writeFileSync(join(dashOut, "data.js"), "window.RADAR=" + JSON.stringify(data) + ";\n");
 
-// ---------------------------------------------------------------------------
-// screenshots/ and the dossier.
-// ---------------------------------------------------------------------------
+  const shotsOut = join(outputDir, "screenshots");
+  mkdirSync(shotsOut, { recursive: true });
+  cpSync(join(here, "screenshots"), shotsOut, { recursive: true });
 
-const shotsOut = join(outputDir, "screenshots");
-mkdirSync(shotsOut, { recursive: true });
-const shotsSrc = join(here, "screenshots");
-if (existsSync(shotsSrc)) {
-  for (const f of readdirSync(shotsSrc)) {
-    if (f.endsWith(".jpg")) copyFileSync(join(shotsSrc, f), join(shotsOut, f));
+  // buildDossier returns the dossier's bytes; write them to
+  // dossier.json ourselves, exactly as returned.
+  const finish = (result: unknown): void => {
+    const dossierPath = join(outputDir, "dossier.json");
+    if (result instanceof Uint8Array) {
+      writeFileSync(dossierPath, result);
+    } else if (typeof result === "string" && !existsSync(dossierPath)) {
+      writeFileSync(dossierPath, result);
+    }
+    if (!existsSync(dossierPath)) {
+      console.error("buildDossier produced no dossier.json");
+      process.exit(1);
+    }
+    console.log(`board rows: ${board.rows.length}`);
+  };
+  const dossier = buildDossier(outputDir, { text_max_bytes: 65536 });
+  if (dossier && typeof (dossier as { then?: unknown }).then === "function") {
+    (dossier as unknown as Promise<unknown>).then(finish, (err) => {
+      console.error(err);
+      process.exit(1);
+    });
+  } else {
+    finish(dossier);
   }
 }
-writeFileSync(join(outputDir, "dossier.json"), buildDossier(outputDir, { text_max_bytes: 65536 }));
 
-console.log(
-  "board rows " + rows.length +
-    " | fit peers " + uni.cleanedPeers.length + " of " + uni.pricedPeers.length +
-    " | verdicts Farm " + counts.Farm + " Thin " + counts.Thin + " Skip " + counts.Skip +
-    " | LOO miss " + roundTo(validation.looFull128.medianMiss, 2) + "x" +
-    " | time split " + roundTo(validation.timeFull.medianMiss, 2) + "x",
-);
+main();

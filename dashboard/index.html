@@ -1,56 +1,63 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Launch Radar — implied values for pre-token protocols</title>
+<title>Token Launch Radar — implied values for protocols that record no token</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <header>
-  <h1>Token Launch Radar</h1>
-  <p class="sub" id="subline">Implied launch values for protocols that record no token yet,
-  priced off the ones whose tokens already trade.</p>
-  <nav>
-    <a href="#board" id="nav-board">Board</a>
-    <a href="#method" id="nav-method">Method &amp; evidence</a>
-  </nav>
-  <p class="badge" id="badge">Recomputing the board from the shipped data…</p>
+  <div class="masthead">
+    <h1>Token Launch Radar</h1>
+    <p class="tagline">What a token would be worth if each protocol's record stayed as it is — priced from the protocols that already launched.</p>
+  </div>
+  <div class="badge" id="recompute-badge">recomputing in your browser…</div>
 </header>
+
+<section class="stats" id="stats"></section>
+
+<section class="about">
+  <h2>How the board is priced</h2>
+  <p id="model-line"></p>
+  <p>The board separates the snapshot three ways before it ranks anything: protocols whose token already trades are the comparables, never the ranked; wrapped, staked, bridged and exchange products of a traded token are set aside; the rest — every watchlist protocol among them — are priced by the curve. Bands come from a seeded bootstrap that refits the curve on resampled comparables (seed 20261114, 240 rounds): they state the model's uncertainty, and each verdict nets a farmer's expected share against the band's low end, never the headline value.</p>
+</section>
+
+<nav class="controls">
+  <input id="q" type="search" placeholder="Search protocol or category…">
+  <div class="verdicts" id="verdict-filter">
+    <button data-v="all" class="on">All verdicts</button>
+    <button data-v="0">Farm</button>
+    <button data-v="1">Thin</button>
+    <button data-v="2">Skip</button>
+  </div>
+  <label>Sort
+    <select id="sort">
+      <option value="rank">Rank</option>
+      <option value="value">Implied value</option>
+      <option value="tvl">TVL</option>
+      <option value="change">7-day change</option>
+      <option value="lo">Band low</option>
+    </select>
+  </label>
+  <label class="wl"><input type="checkbox" id="wl-only"> Watchlist only</label>
+</nav>
+
 <main>
-  <section id="view-board">
-    <div class="strip" id="strip"></div>
-    <div class="controls">
-      <input type="search" id="q" placeholder="Search name or slug">
-      <select id="fcat"><option value="">All categories</option></select>
-      <select id="fver">
-        <option value="">All verdicts</option>
-        <option>Farm</option><option>Thin</option><option>Skip</option>
-      </select>
-      <label class="chk"><input type="checkbox" id="fwatch"> Watchlist only</label>
-      <span class="count" id="count"></span>
-    </div>
-    <table id="board">
-      <thead><tr>
-        <th>#</th><th>Protocol</th><th>Category</th><th class="num">TVL</th>
-        <th class="num">7d %</th><th class="num">Implied value</th><th>Band P25–P75</th>
-        <th>Rank range</th><th>Verdict</th>
-      </tr></thead>
-      <tbody id="rows"></tbody>
-    </table>
-    <p class="note">Band = P25–P75 of the row's value across 200 seeded bootstrap refits of the
-    cleaned peer set; rank range = P10–P90 of its rank across the same refits. Verdicts are farm
-    economics netted in dollars at the band low (Farm), the point estimate only (Thin), or not at
-    all (Skip) — definitions and counts on the Method view. Click a row for the full working.</p>
-  </section>
-  <section id="view-detail" hidden></section>
-  <section id="view-method" hidden></section>
+  <table id="board">
+    <thead>
+      <tr><th>#</th><th>Protocol</th><th>Category</th><th>TVL</th><th>7d</th><th>Implied value</th><th>Band low – high</th><th>Verdict</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="count" id="count"></p>
+  <article id="detail" class="detail" hidden></article>
 </main>
+
 <footer>
-  <p>Every number on this page is re-derived in your browser from the shipped data file and
-  compared against the board the program wrote; the badge above reports the result. Bands,
-  verdicts and plans are computed, not asserted.</p>
+  <p>Implied values are this entry's own claim, derived only from the frozen snapshot's figures — TVL, seven-day growth and how long each protocol has run with no token recorded. They are not a prediction that a token will be issued. Farm plans state their costs and durations; the band low is the number to plan around.</p>
 </footer>
+
 <script src="data.js"></script>
 <script src="app.js"></script>
 </body>
